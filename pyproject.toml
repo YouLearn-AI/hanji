@@ -1,0 +1,75 @@
+[project]
+name = "extract"
+version = "1.0.0"
+description = "Document parsing (PDF, PPTX, DOCX, and images: PNG, JPEG, WebP, TIFF, HEIC/HEIF, BMP) with span-level text, bboxes, tables, and grounded schema extraction."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = [
+    # --- Core PDF / image pipeline ---
+    "pymupdf>=1.25.0",
+    "pikepdf>=10.8.0",           # PDF repair (linearize malformed PDFs)
+    "pillow>=10.0.0",
+    "pillow-heif>=0.13.0",       # HEIC / HEIF input
+    "numpy>=1.26.0",             # vectorized image quality checks
+    # --- Config / typing ---
+    "pydantic>=2.5.2",
+    "pydantic-settings>=2.14.2",
+    "python-dotenv>=1.0.0",
+    # --- HTTP (URL inputs) ---
+    "httpx>=0.28.0",
+    "orjson>=3.10.7",
+    "python-multipart>=0.0.27",
+    # --- Schema extraction (Gemini) + citation tightening ---
+    "google-genai>=1.73.1",
+    "google-cloud-vision>=3.7.0",
+    # --- Office conversion helpers ---
+    "python-pptx>=1.0.2",
+    # Local, no-model legal-layout evidence used only after a strict locator gate.
+    "pdf-inspector==0.2.6",
+    # Legal-document cascade uses one renderer-faithful GFM parser.
+    "markdown-it-py==4.0.0",
+]
+
+[project.optional-dependencies]
+# FastAPI HTTP server. Install with `uv sync --extra api`.
+api = [
+    "fastapi[standard]>=0.104.1",
+    "uvicorn[standard]>=0.49.0",
+]
+# Textract cross-engine read on handwriting-heavy pages (optional quality
+# enrichment for schema extraction; fails open without AWS credentials).
+aws = [
+    "boto3>=1.33.2",
+]
+# Async batch lane: /v1/files + /v1/batches + the worker + webhooks.
+# Needs Postgres (DATABASE_URL) and an S3-compatible object store.
+batch = [
+    "asyncpg>=0.30.0",
+    "boto3>=1.33.2",
+]
+
+[dependency-groups]
+dev = [
+    "jsonschema>=4.26.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    # Independent verifier for the Svix-wire-compatible webhook signatures.
+    "svix>=1.45.0",
+    "ruff>=0.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/extract"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

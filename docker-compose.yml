@@ -1,0 +1,155 @@
+# Three ways to run:
+#
+#   1. API only (point PARSE_MODEL_URL at an existing model endpoint):
+#        docker compose up api
+#
+#   2. API + local GPU model server (needs an NVIDIA GPU with ~12 GB VRAM
+#      and the NVIDIA container toolkit; downloads the weights from
+#      Hugging Face on first start):
+#        docker compose --profile gpu up
+#
+#   3. API + the async batch lane (adds Postgres, MinIO, migrations, and
+#      the batch worker — see docs/batch.md):
+#        docker compose --profile batch up
+#
+# Configure via .env (see .env.example). The batch profile is
+# self-provisioning: the defaults below wire Postgres + MinIO up with no
+# extra configuration; presigned upload/result URLs resolve to
+# localhost:9100.
+
+x-batch-env: &batch-env
+  DATABASE_URL: ${DATABASE_URL:-postgres://extract:extract@postgres:5432/extract}
+  EXTRACT_UPLOADS_BUCKET: ${EXTRACT_UPLOADS_BUCKET:-extract-uploads}
+  EXTRACT_RESULTS_BUCKET: ${EXTRACT_RESULTS_BUCKET:-extract-results}
+  EXTRACT_S3_ENDPOINT_URL: ${EXTRACT_S3_ENDPOINT_URL:-http://minio:9000}
+  EXTRACT_S3_PUBLIC_ENDPOINT_URL: ${EXTRACT_S3_PUBLIC_ENDPOINT_URL:-http://localhost:9100}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-extract}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-extract-secret}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # With the gpu profile the model container is reachable by service name.
+      PARSE_MODEL_URL: ${PARSE_MODEL_URL:-http://model:8000/predict}
+      PARSE_MODEL_API_KEY: ${PARSE_MODEL_API_KEY:-}
+      EXTRACT_WEBHOOK_ALLOW_PRIVATE_URLS: ${EXTRACT_WEBHOOK_ALLOW_PRIVATE_URLS:-false}
+      <<: *batch-env
+
+  model:
+    profiles: ["gpu"]
+    image: lmsysorg/sglang:v0.5.12.post1-cu129
+    command: >
+      bash -c "pip install fastapi uvicorn pillow &&
+               uvicorn server:app --host 0.0.0.0 --port 8000"
+    working_dir: /workspace
+    volumes:
+      - ./serving:/workspace
+      - hf-cache:/root/.cache/huggingface
+    environment:
+      MODEL_PATH: hanji-dev/hanji-parse-4b
+      QWEN_MAX_IMAGE_PIXELS: "2000000"
+      SGLANG_ATTENTION_BACKEND: fa3
+      SGLANG_MM_ATTENTION_BACKEND: fa3
+      SGLANG_MEM_FRACTION_STATIC: "0.85"
+      SGLANG_CHUNKED_PREFILL_SIZE: "8192"
+      SGLANG_ENGINE_EXTRA: '{"speculative_algorithm":"NGRAM","speculative_num_draft_tokens":16,"speculative_ngram_max_bfs_breadth":10,"enable_custom_logit_processor":true}'
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # --- Async batch lane (docs/batch.md) -------------------------------------
+
+  postgres:
+    profiles: ["batch"]
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: extract
+      POSTGRES_PASSWORD: extract
+      POSTGRES_DB: extract
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U extract"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    profiles: ["batch"]
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: extract
+      MINIO_ROOT_PASSWORD: extract-secret
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    profiles: ["batch"]
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 extract extract-secret &&
+      mc mb -p local/extract-uploads local/extract-results &&
+      echo buckets ready"
+
+  migrate:
+    profiles: ["batch"]
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *batch-env
+    command: ["python", "-m", "extract.migrate"]
+
+  worker:
+    profiles: ["batch"]
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PARSE_MODEL_URL: ${PARSE_MODEL_URL:-http://model:8000/predict}
+      PARSE_MODEL_API_KEY: ${PARSE_MODEL_API_KEY:-}
+      EXTRACT_WORKER_LEASE_SECONDS: ${EXTRACT_WORKER_LEASE_SECONDS:-300}
+      EXTRACT_WEBHOOK_ALLOW_PRIVATE_URLS: ${EXTRACT_WEBHOOK_ALLOW_PRIVATE_URLS:-false}
+      <<: *batch-env
+    command: ["python", "-m", "extract.workers.batch_worker"]
+    stop_grace_period: 120s
+
+volumes:
+  hf-cache:
+  pg-data:
+  minio-data:

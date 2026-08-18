@@ -1,0 +1,123 @@
+diff -u -r work_orig/sglang/jit_kernel/csrc/ngram_corpus/ngram.cpp work/sglang/jit_kernel/csrc/ngram_corpus/ngram.cpp
+--- a/sglang/jit_kernel/csrc/ngram_corpus/ngram.cpp	2026-08-07 19:52:41
++++ b/sglang/jit_kernel/csrc/ngram_corpus/ngram.cpp	2026-08-07 19:52:41
+@@ -36,7 +36,9 @@
+     }
+   }
+ 
+-  trie_ = std::make_unique<Trie>(capacity, param_);
++  // DETERMINISM FIX (A): no global trie. Per-request tries are created on
++  // demand in batchMatch with kPerRequestTrieCapacity nodes each.
++  (void)capacity;
+ 
+   insert_worker_ = std::thread(&Ngram::insertWorker, this);
+ }
+@@ -54,13 +56,13 @@
+ }
+ 
+ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
+-  {
+-    std::lock_guard<std::mutex> lock(mutex_);
+-    pending_count_ += tokens.size();
+-  }
+-  for (auto&& token : tokens) {
+-    insert_queue_.enqueue(std::move(token));
+-  }
++  // DETERMINISM FIX (A): the shared corpus is gone. ngram_worker's
++  // _update_ngram_corpus() fed EVERY request's tokens into one trie; that is
++  // exactly the cross-request channel. Each request now inserts its own
++  // window into its own trie at the top of batchMatch (same window, same
++  // order, one step earlier), so this path is a no-op and the FFI / Python
++  // signatures are untouched.
++  (void)tokens;
+ }
+ 
+ // NOTE: staging operations (start/append/finish) are called from a background
+@@ -132,7 +134,7 @@
+       break;
+     }
+     std::unique_lock<std::mutex> lock(mutex_);
+-    trie_->insert(data.data(), data.size());
++    // DETERMINISM FIX (A): nothing is ever enqueued now; drain-and-drop.
+     --pending_count_;
+     lock.unlock();
+     sync_cv_.notify_all();
+@@ -181,15 +183,34 @@
+ 
+     auto& state = match_state_[state_ids[i]];
+ 
++    // DETERMINISM FIX (A): get-or-create THIS request's private trie and feed
++    // it only this request's own tokens. `suffix` is byte-identical to what
++    // _update_ngram_corpus() used to insert one step later, so trie content at
++    // match time is unchanged -- only its ownership is.
++    auto& trie_slot = tries_[state_ids[i]];
++    // CONTAMINATION GUARD. state_ids are RECYCLED. If a request aborts on a path
++    // that never reaches eraseMatchState, its trie would survive and the next
++    // request handed the same state_id would inherit its drafts -- resurrecting
++    // the exact cross-request coupling this patch exists to remove. A fresh
++    // request is identifiable with no scheduler plumbing: match_state_ is
++    // default-constructed for it, so processed_total_len == 0 at its first
++    // match. Rebuilding the trie whenever we see that makes inherited state
++    // impossible REGARDLESS of whether cleanup ran. Cost: once per request.
++    if (!trie_slot || state.processed_total_len == 0) {
++      trie_slot = std::make_unique<Trie>(kPerRequestTrieCapacity, param_);
++    }
++    Trie* trie = trie_slot.get();
++    trie->insert(suffix.data(), suffix.size());
++
+     if (total_sam_budget == 0 || per_sam_budget == 0) {
+-      auto res = (trie_.get()->*trie_result_build_fn)(
++      auto res = (trie->*trie_result_build_fn)(
+           suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
+       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
+       merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
+       continue;
+     }
+ 
+-    auto combined = (trie_.get()->*trie_result_build_fn)(
++    auto combined = (trie->*trie_result_build_fn)(
+         suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
+ 
+     for (const auto& [_, sam] : sams_) {
+@@ -208,6 +229,8 @@
+   std::unique_lock<std::mutex> lock(mutex_);
+   for (const auto& sid : state_ids) {
+     match_state_.erase(sid);
++    // DETERMINISM FIX (A): release the request's private trie with its state.
++    tries_.erase(sid);
+   }
+ }
+ 
+diff -u -r work_orig/sglang/jit_kernel/csrc/ngram_corpus/ngram.h work/sglang/jit_kernel/csrc/ngram_corpus/ngram.h
+--- a/sglang/jit_kernel/csrc/ngram_corpus/ngram.h	2026-08-07 19:52:41
++++ b/sglang/jit_kernel/csrc/ngram_corpus/ngram.h	2026-08-07 19:52:41
+@@ -18,7 +18,15 @@
+ namespace ngram {
+ 
+ class Ngram {
+-  std::unique_ptr<Trie> trie_;
++  // DETERMINISM FIX (A): one PRIVATE Trie per request state_id. A single
++  // process-global trie made every request's draft a function of the other
++  // requests in flight (their tokens created nodes, bumped freq, reordered
++  // per-node lru, and drove LRU eviction). Keyed by the same state_id that
++  // already keys match_state_, so no new plumbing is required.
++  std::unordered_map<int64_t, std::unique_ptr<Trie>> tries_;
++  // Hardcoded per-request node budget (~176 B/node => ~11.5 MB/request).
++  // Replaces the single `capacity`-node global trie (default 10M => ~1.8 GB).
++  static constexpr size_t kPerRequestTrieCapacity = 65536;
+   std::unordered_map<std::string, std::unique_ptr<SuffixAutomaton>> sams_;
+   // FIXME: single staging slot — only one corpus can be loaded at a time.
+   // To support concurrent loads, move staging into a per-load local variable.
+@@ -73,9 +81,9 @@
+   // should not be affected by cache flushes.
+   void reset() {
+     std::unique_lock<std::mutex> lock(mutex_);
+-    if (trie_) {
+-      trie_->reset();
+-    }
++    // DETERMINISM FIX (A): drop every per-request trie. Paired with
++    // NgramCorpus.reset() clearing _req_id_to_state_id, so keys stay coherent.
++    tries_.clear();
+     match_state_.clear();
+   }
+ 

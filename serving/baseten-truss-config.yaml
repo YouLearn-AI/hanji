@@ -1,0 +1,27 @@
+# Alternative deploy path: Baseten (truss push). Serves serving/server.py on an
+# H100 with the production engine configuration. Copy server.py into data/ per
+# truss layout, or adjust build to your infra. For the determinism patch, see
+# SELF_HOSTING.md ("Byte-determinism").
+base_image:
+  image: lmsysorg/sglang:v0.5.12.post1-cu129
+model_name: hanji-parse-4b
+docker_server:
+  start_command: sh -c "pip install fastapi uvicorn pillow && cd /app/data && uvicorn server:app --host 0.0.0.0 --port 8000"
+  server_port: 8000
+  predict_endpoint: /predict
+  readiness_endpoint: /health
+  liveness_endpoint: /health
+resources:
+  accelerator: H100
+  use_gpu: true
+runtime:
+  predict_concurrency: 8
+environment_variables:
+  MODEL_PATH: hanji-dev/hanji-parse-4b
+  QWEN_MAX_IMAGE_PIXELS: "2000000"
+  SGLANG_ATTENTION_BACKEND: fa3
+  SGLANG_MM_ATTENTION_BACKEND: fa3
+  SGLANG_MEM_FRACTION_STATIC: "0.85"
+  SGLANG_MAX_RUNNING_REQUESTS: "8"
+  SGLANG_CHUNKED_PREFILL_SIZE: "8192"
+  SGLANG_ENGINE_EXTRA: '{"speculative_algorithm":"NGRAM","speculative_num_draft_tokens":16,"speculative_ngram_max_bfs_breadth":10,"enable_custom_logit_processor":true}'
